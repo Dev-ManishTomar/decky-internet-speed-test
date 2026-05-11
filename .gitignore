@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+bower_components/
+
+# Build output
+dist/
+out/
+
+# Environment / secrets
+.env
+.env.deck
+
+# Python
+__pycache__/
+*.pyc
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.iml
+.vscode/settings.json
+
+# Decky CLI / build tools
+cli/
+decky_plugin.py
+
+# Logs
+*.log
+logs/
+
+# Misc
+*.seed
+*.dat
+*.out
+*.pid
+*.gz
+*.swp
+coverage/
+tmp/
+/.yalc
+yalc.lock
+
+# Lock file for source map (not needed in repo)
+dist/index.js.map

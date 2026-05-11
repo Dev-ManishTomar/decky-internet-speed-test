@@ -1,0 +1,11 @@
+{
+  "name": "Internet Speed Test",
+  "author": "Dev-ManishTomar",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility", "network", "speed-test"],
+    "description": "Run internet speed tests directly from your Steam Deck. Measures download, upload, ping, and jitter using Cloudflare's global edge network.",
+    "image": "https://opengraph.githubassets.com/1/Dev-ManishTomar/decky-internet-speed-test"
+  }
+}

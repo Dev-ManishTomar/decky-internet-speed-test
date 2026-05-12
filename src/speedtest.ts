@@ -1,9 +1,13 @@
 /**
- * Frontend-based speed test engine using browser fetch().
+ * Frontend speed test engine using browser fetch() + PerformanceResourceTiming.
  *
- * Runs entirely in the browser (Chromium on Steam Deck) so SSL works natively.
- * Uses Cloudflare's methodology: progressive request sizes, 90th percentile,
- * sequential requests to avoid rate limiting.
+ * Timing: Uses the Resource Timing API to measure actual data transfer time,
+ * excluding DNS lookup, TCP connect, and TLS handshake — matching Cloudflare's approach.
+ *
+ * Aggregation: Ookla-style — sort all samples by speed, discard top 10% (burst)
+ * and bottom 30% (warmup/overhead noise), average the middle 60%.
+ *
+ * Progressive sizes following Cloudflare's methodology.
  */
 
 export interface SpeedTestResult {
@@ -19,9 +23,9 @@ export type TestPhase = "idle" | "ping" | "download" | "upload" | "complete" | "
 
 export interface ProgressUpdate {
   phase: TestPhase;
-  speed: number;      // current bps
-  samples: number[];  // all bps samples for chart
-  p90: number;        // 90th percentile bps
+  speed: number;
+  samples: number[];
+  p90: number;
 }
 
 interface BandwidthPoint {
@@ -30,26 +34,48 @@ interface BandwidthPoint {
   duration: number;
 }
 
-const MIN_DURATION_MS = 10;
+const MIN_DURATION_MS = 50;
 const MAX_DURATION_MS = 3000;
-const P90 = 0.9;
 const P50 = 0.5;
 
 const DOWNLOAD_CONFIG = [
-  { bytes: 100_000, count: 4 },
-  { bytes: 1_000_000, count: 6 },
+  { bytes: 100_000, count: 3 },
+  { bytes: 1_000_000, count: 5 },
   { bytes: 5_000_000, count: 5 },
   { bytes: 10_000_000, count: 4 },
   { bytes: 25_000_000, count: 3 },
 ];
 
 const UPLOAD_CONFIG = [
-  { bytes: 100_000, count: 4 },
-  { bytes: 500_000, count: 5 },
+  { bytes: 100_000, count: 3 },
+  { bytes: 500_000, count: 4 },
   { bytes: 1_000_000, count: 5 },
   { bytes: 5_000_000, count: 4 },
   { bytes: 10_000_000, count: 3 },
 ];
+
+/**
+ * Ookla-style aggregation:
+ * Sort by speed, discard bottom 30% and top 10%, average the middle 60%.
+ */
+function calcBandwidth(points: BandwidthPoint[]): number {
+  const valid = points.filter((p) => p.duration >= MIN_DURATION_MS);
+  if (valid.length === 0) return 0;
+
+  const speeds = valid.map((p) => p.bps).sort((a, b) => a - b);
+  const n = speeds.length;
+
+  if (n <= 3) {
+    return speeds[Math.floor(n / 2)];
+  }
+
+  const cutBottom = Math.floor(n * 0.3);
+  const cutTop = Math.max(1, Math.floor(n * 0.1));
+  const middle = speeds.slice(cutBottom, n - cutTop);
+
+  if (middle.length === 0) return speeds[Math.floor(n / 2)];
+  return middle.reduce((sum, v) => sum + v, 0) / middle.length;
+}
 
 function percentile(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
@@ -57,11 +83,22 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
 }
 
-function calcBandwidth(points: BandwidthPoint[]): number {
-  const valid = points.filter((p) => p.duration >= MIN_DURATION_MS);
-  if (valid.length === 0) return 0;
-  const speeds = valid.map((p) => p.bps).sort((a, b) => a - b);
-  return percentile(speeds, P90);
+/**
+ * Get precise transfer duration from PerformanceResourceTiming.
+ * This gives us responseEnd - requestStart, which excludes DNS, TCP, TLS setup.
+ * Falls back to the raw duration if the entry isn't available.
+ */
+function getPreciseDuration(url: string, fallbackMs: number): number {
+  try {
+    const entries = performance.getEntriesByName(url, "resource") as PerformanceResourceTiming[];
+    if (entries.length > 0) {
+      const entry = entries[entries.length - 1];
+      const transferTime = entry.responseEnd - entry.requestStart;
+      performance.clearResourceTimings();
+      if (transferTime > 0) return transferTime;
+    }
+  } catch { /* API not available */ }
+  return fallbackMs;
 }
 
 export async function fetchServerLocation(): Promise<string> {
@@ -98,19 +135,16 @@ export class SpeedTestEngine {
     this.ac = new AbortController();
 
     try {
-      // Ping
       this.onProgress({ phase: "ping", speed: 0, samples: [], p90: 0 });
       const { latency, jitter } = await this.measurePing();
 
       if (!this.running) return;
 
-      // Download
       this.onProgress({ phase: "download", speed: 0, samples: [], p90: 0 });
       const dl = await this.measureTransfer("download", DOWNLOAD_CONFIG);
 
       if (!this.running) return;
 
-      // Upload
       this.onProgress({ phase: "upload", speed: 0, samples: [], p90: 0 });
       const ul = await this.measureTransfer("upload", UPLOAD_CONFIG);
 
@@ -183,19 +217,23 @@ export class SpeedTestEngine {
         if (!this.running || shouldStop) break;
 
         try {
-          const start = performance.now();
+          const url = type === "download"
+            ? `https://speed.cloudflare.com/__down?bytes=${bytes}&r=${Math.random()}`
+            : "https://speed.cloudflare.com/__up";
+
+          const rawStart = performance.now();
           let transferBytes: number;
 
           if (type === "download") {
-            const resp = await fetch(
-              `https://speed.cloudflare.com/__down?bytes=${bytes}&r=${Math.random()}`,
-              { signal: this.ac!.signal, cache: "no-store" },
-            );
+            const resp = await fetch(url, {
+              signal: this.ac!.signal,
+              cache: "no-store",
+            });
             const blob = await resp.blob();
             transferBytes = blob.size;
           } else {
             const data = uploadData!.slice(0, bytes);
-            const resp = await fetch("https://speed.cloudflare.com/__up", {
+            const resp = await fetch(url, {
               method: "POST",
               body: new Blob([data]),
               signal: this.ac!.signal,
@@ -204,7 +242,8 @@ export class SpeedTestEngine {
             transferBytes = bytes;
           }
 
-          const duration = performance.now() - start;
+          const rawDuration = performance.now() - rawStart;
+          const duration = getPreciseDuration(url, rawDuration);
           const bps = (transferBytes * 8) / (duration / 1000);
 
           all.push({ bytes, bps, duration });
